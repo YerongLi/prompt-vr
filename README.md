@@ -65,11 +65,8 @@ DO NOT CHANGE anything in the provided config files(configs/xx/xxxx.yaml) even i
 `--multi-gpu-test` Is disabled.
 
 
+`
+git pull; cd lib; bash make.sh; cd ../; CUDA_VISIBLE_DEVICES=4 python -u ./tools/test_prompt.py --dataset vg --output_dir Outputs/prompt1 | tee prompt.txt
 
-### Visual Relation Detection
-To test a evaluation a trained model run
-```
-git pull;cd lib;sh make.sh;cd ..;CUDA_VISIBLE_DEVICES=6 python ./tools/test_net_rel.py --dataset vrd --cfg configs/vrd/e2e_faster_rcnn_VGG16_16_epochs_vrd_v3_default_node_contrastive_loss_w_so_p_aware_margin_point2_so_weight_point5_IN_pretrained.yaml --load_ckpt ~/trained_models/vrd_VGG16_IN_pretrained/model_step7559.pth --output_dir Outputs/vrd_VGG16_IN_pretrained --do_val --use_gt_boxesgit pull;cd lib;sh make.sh;cd ..;CUDA_VISIBLE_DEVICES=6 python ./tools/test_net_rel.py --dataset vrd --cfg configs/vrd/e2e_faster_rcnn_VGG16_16_epochs_vrd_v3_default_node_contrastive_loss_w_so_p_aware_margin_point2_so_weight_point5_IN_pretrained.yaml --load_ckpt ~/trained_models/vrd_VGG16_IN_pretrained/model_step7559.pth --output_dir Outputs/vrd_VGG16_IN_pretrained --do_val --use_gt_boxes
-```
-See [img/load_vrd.jpg](img/load_vrd.jpg) for expected output, as long as we can see bounding box we are good.
+`
 
