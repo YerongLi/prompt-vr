@@ -1,0 +1,396 @@
+""" Training script for steps_with_decay policy"""
+
+import _init_paths  # pylint: disable=unused-import
+
+import argparse
+import os
+import sys
+import resource
+import traceback
+import logging
+import tqdm
+import matplotlib.pyplot as plt
+import clip
+import numpy as np
+import pickle
+import multiprocessing
+from datasets_rel import task_evaluation_vg_and_vrd as task_evaluation_vg_and_vrd
+
+from collections import defaultdict
+
+# Adapted by Ji Zhang, 2019
+#
+# Based on Detectron.pytorch/tools/test_net.py Written by Roy Tseng
+
+"""Perform inference on one or more datasets."""
+
+
+import torch
+
+import _init_paths  # pylint: disable=unused-import
+from datasets_rel.json_dataset_rel import JsonDatasetRel
+
+from torch.autograd import Variable
+import torch.nn as nn
+import cv2
+from PIL import Image
+cv2.setNumThreads(0)  # pytorch issue 1355: possible deadlock in dataloader
+
+
+from utils.logging import setup_logging
+
+# Set up logging and load config options
+logger = setup_logging(__name__)
+logging.getLogger('roi_data.loader').setLevel(logging.INFO)
+
+# RuntimeError: received 0 items of ancdata. Issue: pytorch/pytorch#973
+rlimit = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (4096, rlimit[1]))
+
+def parse_args():
+    """Parse input arguments"""
+    parser = argparse.ArgumentParser(description='Train a X-RCNN network')
+
+    parser.add_argument(
+        '--output_dir',
+        help='output directory to save the testing results. If not provided, '
+             'defaults to [args.load_ckpt|args.load_detectron]/../test.')
+
+    parser.add_argument(
+        '--dataset', dest='dataset', required=True,
+        help='Dataset to use')
+    # parser.add_argument(
+    #     '--cfg', dest='cfg_file', required=True,
+    #     help='Config file for training (and optionally testing)')
+    parser.add_argument(
+        '--set', dest='set_cfgs',
+        help='Set config keys. Key value sequence seperate by whitespace.'
+             'e.g. [key] [value] [key] [value]',
+        default=[], nargs='+')
+
+    parser.add_argument(
+        '--disp_interval',
+        help='Display training info every N iterations',
+        default=20, type=int)
+    parser.add_argument(
+        '--no_cuda', dest='cuda', help='Do not use CUDA device', action='store_false')
+
+    # Optimization
+    # These options has the highest prioity and can overwrite the values in config file
+    # or values set by set_cfgs. `None` means do not overwrite.
+    parser.add_argument(
+        '--bs', dest='batch_size',
+        help='Explicitly specify to overwrite the value comed from cfg_file.',
+        type=int)
+
+    parser.add_argument(
+        '--reg',
+        help='resume to training on a checkpoint',
+        action='store_true')
+
+    # Resume training: requires same iterations per epoch
+    parser.add_argument(
+        '--resume',
+        help='resume to training on a checkpoint',
+        action='store_true')
+
+    parser.add_argument(
+        '--no_save', help='do not save anything', action='store_true')
+
+    parser.add_argument(
+        '--load_ckpt', help='checkpoint path to load')
+    parser.add_argument(
+        '--load_detectron', help='path to the detectron weight pickle file')
+
+    parser.add_argument(
+        '--use_tfboard', help='Use tensorflow tensorboard to log training info',
+        action='store_true')
+
+    return parser.parse_args()
+
+
+def save_ckpt(output_dir, args, step, train_size, model, optimizer):
+    """Save checkpoint"""
+    if args.no_save:
+        return
+    ckpt_dir = os.path.join(output_dir, 'ckpt')
+    if not os.path.exists(ckpt_dir):
+        os.makedirs(ckpt_dir)
+    save_name = os.path.join(ckpt_dir, 'model_step{}.pth'.format(step))
+    model_state_dict = model.state_dict()
+    torch.save({
+        'step': step,
+        'train_size': train_size,
+        'batch_size': args.batch_size,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict()}, save_name)
+    logger.info('save model: %s', save_name)
+
+
+def get_roidb_and_dataset(dataset_name, proposal_file, ind_range, do_val=True):
+    """Get the roidb for the dataset specified in the global cfg. Optionally
+    restrict it to a range of indices if ind_range is a pair of integers.
+    Param dataset_name DATASETS.keys in file lib/datasets_rel/dataset_catalog_rel.py
+    Return roidb
+    Return loaced dataset from the original datafiles
+            dataset.rel_anns contains the bounding boxes inside each image
+    """
+    logger.info('Load dataset with annotations with JsonDatasetRel')
+    dataset = JsonDatasetRel(dataset_name)
+    # logger.info(dataset.rel_anns['000000000002.jpg'])
+    # [{'predicate': 0, 'object': {'category': 40, 'bbox': [265, 762, 482, 891]},
+    # 'subject': {'category': 65, 'bbox': [410, 525, 583, 714]}},
+    # {'predicate': 2, 'object': {'category': 65, 'bbox': [410, 525, 583, 714]},
+    # 'subject': {'category': 40, 'bbox': [265, 762, 482, 891]}},
+    # {'predicate': 27, 'object': {'category': 40, 'bbox': [265, 762, 482, 891]},
+    # 'subject': {'category': 0, 'bbox': [440, 767, 660, 1020]}}]
+    roidb = dataset.get_roidb(gt=do_val)
+
+    if ind_range is not None:
+        total_num_images = len(roidb)
+        start, end = ind_range
+        roidb = roidb[start:end]
+    else:
+        start = 0
+        end = len(roidb)
+        total_num_images = end
+
+    return roidb, dataset, start, end, total_num_images
+
+def bbox_to_rect(bbox, color, linestyle='-'):
+    """Convert bounding box to matplotlib format."""
+    # Convert the bounding box (upper-left x, upper-left y, lower-right x,
+    # lower-right y) format to the matplotlib format: ((upper-left x,
+    # upper-left y), width, height)
+    return plt.Rectangle(
+        xy=(bbox[0], bbox[1]), width=bbox[2]-bbox[0], height=bbox[3]-bbox[1],
+        fill=False, edgecolor=color, linewidth=2, linestyle=linestyle)
+
+
+def get_cmap(n, name='hsv'):
+    '''Returns a function that maps each index in 0, 1, ..., n-1 to a distinct
+    RGB color; the keyword argument name must be a standard mpl colormap name.'''
+    return plt.cm.get_cmap(name, n)
+
+def myfunc(p):
+
+    product_of_list = np.prod(p)
+
+    return product_of_list
+def process_chunks(param):
+    roidb, device_id = param
+    model, preprocess = clip.load("ViT-B/32", device = f'cuda:{device_id}')
+
+    all_results = []
+    for i, entry in tqdm.tqdm(enumerate(roidb), total=len(roidb)):
+        im_result = dict()
+        im = Image.open(entry['image']).convert('RGB')
+        images = []
+        # for box in entry['sbj_gt_boxes']:
+        #     crop = im.crop(box)
+        #     images.append(preprocess(crop))
+        # with torch.no_grad():
+        #     image_features = model.encode_image(torch.tensor(np.stack(images)).cuda()).float()
+        # scores = torch.mm(image_features, text_features).cpu().numpy()
+
+        im_result['sbj_boxes'] = entry['sbj_gt_boxes']
+        # im_result['sbj_labels'] = np.argmax(scores, axis=1).astype(int) + 1
+        # im_result['sbj_scores'] = np.max(scores, axis=1)
+        im_result['sbj_labels'] = entry['sbj_gt_classes']
+        im_result['sbj_scores'] = np.ones(len(entry['sbj_gt_boxes']))
+
+
+        im_result['gt_sbj_boxes'] = entry['sbj_gt_boxes']
+        im_result['gt_sbj_labels'] = entry['sbj_gt_classes']
+
+        images.clear()
+        # for box in entry['obj_gt_boxes']:
+        #     crop = im.crop(box)
+        #     images.append(preprocess(crop))
+        # with torch.no_grad():
+        #     image_features = model.encode_image(torch.tensor(np.stack(images)).cuda()).float()
+        # scores = torch.mm(image_features, text_features).cpu().numpy()
+
+
+        im_result['obj_boxes'] = entry['obj_gt_boxes']
+        # im_result['obj_labels'] = np.argmax(scores, axis=1).astype(int) + 1
+        # im_result['obj_scores'] = np.max(scores, axis=1)
+
+        im_result['obj_labels'] = entry['obj_gt_classes']
+        im_result['obj_scores'] = np.ones(len(entry['obj_gt_boxes']))
+
+        im_result['gt_obj_boxes'] = entry['obj_gt_boxes']
+        im_result['gt_obj_labels'] = entry['obj_gt_classes']
+        prd_scores_ttl = []
+        for i in range(len(im_result['sbj_boxes'])):
+            box = im_result['sbj_boxes'][i]
+            box[0] = min(box[0], im_result['obj_boxes'][i][0]) # left
+            box[1] = min(box[1], im_result['obj_boxes'][i][1]) # top
+            box[2] = max(box[2], im_result['obj_boxes'][i][2]) # right
+            box[3] = max(box[3], im_result['obj_boxes'][i][3]) # bottom
+            crop = im.crop(box)
+            texts = []
+            for pred in dataset.prd_classes:
+                texts.append('The '+ id_to_category_map[im_result['sbj_labels'][i]] +
+                             ' ' + pred + ' the ' + id_to_category_map[im_result['obj_labels'][i]])
+            with torch.no_grad():
+                text_features = model.encode_text(clip.tokenize(texts).device('cuda', device_id)).float().transpose(1, 0)
+                image_feature = model.encode_image(preprocess(crop).unsqueeze(0).device('cuda', device_id)).float()
+            scores =[0.0] * 51
+            scores[1:] = torch.mm(image_feature, text_features).cpu().numpy().squeeze()
+            prd_scores_ttl.append(scores)
+        im_result['prd_scores_ttl'] = np.array(prd_scores_ttl)
+
+        # metadata
+        im_result['image'] = entry['file_name']
+        im_result['gt_prd_labels'] = entry['prd_gt_classes']
+
+        all_results.append(im_result)
+        return all_results
+def main():
+    num_gpu = torch.cuda.device_count()
+    """Main function"""
+    args = parse_args()
+    if args.output_dir is None:
+        ckpt_path = args.load_ckpt if args.load_ckpt else args.load_detectron
+        args.output_dir = os.path.join(
+            os.path.dirname(os.path.dirname(ckpt_path)), 'test')
+        logger.info('Automatically set output directory to %s', args.output_dir)
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    if args.output_dir is None:
+        ckpt_path = args.load_ckpt if args.load_ckpt else args.load_detectron
+        args.output_dir = os.path.join(
+            os.path.dirname(os.path.dirname(ckpt_path)), 'test')
+        logger.info('Automatically set output directory to %s', args.output_dir)
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    det_file = os.path.join(args.output_dir, 'results1.pkl')
+    if os.path.exists(det_file) and not args.reg:  ## DEBUG
+        logger.info('Loading results from {}'.format(det_file))
+        with open(det_file, 'rb') as f:
+            all_results = pickle.load(f)
+        logger.info('Starting evaluation now...')
+        task_evaluation_vg_and_vrd.eval_rel_results(all_results, args.output_dir, args.do_val)
+        return
+    dataset_name = 'vg_val'
+    # model, preprocess = clip.load("ViT-B/32")
+
+    roidb, dataset, start_ind, end_ind, total_num_images = get_roidb_and_dataset(
+        dataset_name, None, None, True
+    )
+    id_to_category_map ={dataset.category_to_id_map[k] : k for k in dataset.category_to_id_map}
+    id_to_category_map[0] = 'unknown object'
+    # logger.info('roidb length: %d', len(roidb))
+    # logger.info('dataset type:'+ str(type(dataset)))
+    #
+    # # print(dataset.rel_anns.keys())
+    # # print(dir(dataset))
+    # logger.info('dataset information')
+
+    # exit()
+
+    # description = {
+    #     dataset.category_to_id_map[category] : 'This is an image of a ' + category
+    #         for category in dataset.category_to_id_map
+    # }
+    #
+    # description = [description[i+1] for i in range(len(description))]
+    # # print(description)
+    # text_tokens = clip.tokenize(["This is " + desc for desc in description]).cuda()
+    # with torch.no_grad():
+    #     # image_features = model.encode_image(image_input).float()
+    #     text_features = model.encode_text(text_tokens).float().transpose(1, 0)
+    # params = [[roidb[:100], 0], [roidb[100:200], 1]]
+    #
+    # with multiprocessing.Pool(processes=4) as pool:
+    #
+    #     result_list = pool.map(process_chunks, data_pairs)
+
+    # exit()
+    # with multiprocessing.Pool(num_gpu) as pool:
+    #     results = pool.imap_unordered(func=process_chunks, iterable=params)
+    #     all_results = []
+    #     for result in results:
+    #         all_results.extend(result)
+    models, preprocesses = [],[]
+    for device_id in range(num_gpu):
+        model, preprocess = clip.load("ViT-B/32", device = f'cuda:{device_id}')
+        models.append(model)
+        preprocesses.append(preprocess)
+    model, process = models[0], preprocesses[0]
+    # roidb = roidb[:2000]
+    all_results = []
+    for i, entry in tqdm.tqdm(enumerate(roidb), total=len(roidb)):
+        im_result = dict()
+        im = Image.open(entry['image']).convert('RGB')
+        images = []
+        # for box in entry['sbj_gt_boxes']:
+        #     crop = im.crop(box)
+        #     images.append(preprocess(crop))
+        # with torch.no_grad():
+        #     image_features = model.encode_image(torch.tensor(np.stack(images)).cuda()).float()
+        # scores = torch.mm(image_features, text_features).cpu().numpy()
+
+        im_result['sbj_boxes'] = entry['sbj_gt_boxes']
+        # im_result['sbj_labels'] = np.argmax(scores, axis=1).astype(int) + 1
+        # im_result['sbj_scores'] = np.max(scores, axis=1)
+        im_result['sbj_labels'] = entry['sbj_gt_classes']
+        im_result['sbj_scores'] = np.ones(len(entry['sbj_gt_boxes']))
+
+
+        im_result['gt_sbj_boxes'] = entry['sbj_gt_boxes']
+        im_result['gt_sbj_labels'] = entry['sbj_gt_classes']
+
+        images.clear()
+        # for box in entry['obj_gt_boxes']:
+        #     crop = im.crop(box)
+        #     images.append(preprocess(crop))
+        # with torch.no_grad():
+        #     image_features = model.encode_image(torch.tensor(np.stack(images)).cuda()).float()
+        # scores = torch.mm(image_features, text_features).cpu().numpy()
+
+
+        im_result['obj_boxes'] = entry['obj_gt_boxes']
+        # im_result['obj_labels'] = np.argmax(scores, axis=1).astype(int) + 1
+        # im_result['obj_scores'] = np.max(scores, axis=1)
+
+        im_result['obj_labels'] = entry['obj_gt_classes']
+        im_result['obj_scores'] = np.ones(len(entry['obj_gt_boxes']))
+
+        im_result['gt_obj_boxes'] = entry['obj_gt_boxes']
+        im_result['gt_obj_labels'] = entry['obj_gt_classes']
+        prd_scores_ttl = []
+        for i in range(len(im_result['sbj_boxes'])):
+            box = im_result['sbj_boxes'][i]
+            box[0] = min(box[0], im_result['obj_boxes'][i][0]) # left
+            box[1] = min(box[1], im_result['obj_boxes'][i][1]) # top
+            box[2] = max(box[2], im_result['obj_boxes'][i][2]) # right
+            box[3] = max(box[3], im_result['obj_boxes'][i][3]) # bottom
+            crop = im.crop(box)
+            texts = []
+            for pred in dataset.prd_classes:
+                texts.append('The '+ id_to_category_map[im_result['sbj_labels'][i]] +
+                             ' ' + pred + ' the ' + id_to_category_map[im_result['obj_labels'][i]])
+            with torch.no_grad():
+                text_features = model.encode_text(clip.tokenize(texts).cuda()).float().transpose(1, 0)
+                image_feature = model.encode_image(preprocess(crop).unsqueeze(0).cuda()).cuda().float()
+            scores =[0.0] * 51
+            scores[1:] = torch.mm(image_feature, text_features).cpu().numpy().squeeze()
+            prd_scores_ttl.append(scores)
+        im_result['prd_scores_ttl'] = np.array(prd_scores_ttl)
+
+        # metadata
+        im_result['image'] = entry['file_name']
+        im_result['gt_prd_labels'] = entry['prd_gt_classes']
+
+        all_results.append(im_result)
+    pickle.dump(all_results, open(det_file, 'wb'))
+    task_evaluation_vg_and_vrd.eval_rel_results(all_results, args.output_dir, True)
+
+
+
+if __name__ == '__main__':
+    main()
+
+
